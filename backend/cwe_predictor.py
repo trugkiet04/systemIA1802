@@ -338,15 +338,145 @@ def _conf_label(conf: float) -> str:
     return "LOW"
 
 
+# ── CWEClassifier — ML model (SecBERT fine-tuned) ────────────────────────────
+
+class CWEClassifier:
+    """
+    SecBERT fine-tuned trên NVD CVE descriptions → CWE categories.
+
+    Được train bởi: python untils/train_cwe_classifier.py
+    Model lưu tại: models/bert_cwe/
+
+    Inference:
+        text = build_profile_text(pe_analysis)  # behavior description
+        predictions = classifier.predict(text, top_k=5)
+        # [{"cwe_id": "CWE-94", "confidence": 0.87, ...}, ...]
+    """
+
+    MODEL_DIR = Path(__file__).parent.parent / "models" / "bert_cwe"
+    META_FILE = Path(__file__).parent.parent / "models" / "bert_cwe_meta.json"
+
+    def __init__(self):
+        self._available  = False
+        self._model      = None
+        self._tokenizer  = None
+        self._id2label: dict[int, str] = {}
+        self._max_length = 256
+        self._load()
+
+    def _load(self) -> None:
+        """Load fine-tuned model. Silent fail if not trained yet."""
+        if not self.MODEL_DIR.exists() or not self.META_FILE.exists():
+            return
+
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+            with open(self.META_FILE) as f:
+                import json
+                meta = json.load(f)
+
+            self._max_length = meta.get("max_length", 256)
+            self._id2label   = {int(k): v for k, v in meta["id2label"].items()}
+
+            self._tokenizer = AutoTokenizer.from_pretrained(str(self.MODEL_DIR))
+            self._model     = AutoModelForSequenceClassification.from_pretrained(
+                str(self.MODEL_DIR)
+            )
+            self._model.eval()
+            self._torch     = torch
+            self._available = True
+
+            n = len(self._id2label)
+            print(f"[CWE ML] Loaded fine-tuned SecBERT CWE classifier ({n} classes)")
+
+        except Exception as e:
+            print(f"[CWE ML] Model load failed (will use rule-based fallback): {e}")
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def predict(self, text: str, top_k: int = 5) -> list[dict]:
+        """
+        Predict CWE categories from input text.
+
+        Parameters
+        ----------
+        text   : behavior profile text (từ build_profile_text) hoặc CVE description
+        top_k  : số CWE trả về
+
+        Returns
+        -------
+        list of dicts sorted by confidence DESC (same format as predict_cwe())
+        """
+        if not self._available:
+            return []
+
+        import torch
+        import torch.nn.functional as F
+
+        try:
+            inputs = self._tokenizer(
+                text,
+                max_length=self._max_length,
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                logits = self._model(**inputs).logits
+            probs = F.softmax(logits, dim=-1)[0]
+
+            # Get top-K
+            topk_vals, topk_ids = torch.topk(probs, min(top_k, len(self._id2label)))
+
+            results = []
+            for score, idx in zip(topk_vals.tolist(), topk_ids.tolist()):
+                cwe_id = self._id2label.get(idx, f"CWE-{idx}")
+                meta   = CWE_CATALOG.get(cwe_id)
+                results.append({
+                    "cwe_id":       cwe_id,
+                    "name":         meta[0] if meta else cwe_id,
+                    "description":  meta[1] if meta else "",
+                    "confidence":   round(score, 4),
+                    "label":        _conf_label(score),
+                    "triggered_by": ["SecBERT CWE classifier (fine-tuned on NVD)"],
+                    "source":       "ml_model",
+                })
+
+            return results
+
+        except Exception as e:
+            print(f"[CWE ML] Prediction error: {e}")
+            return []
+
+
+# ── Singleton CWEClassifier ───────────────────────────────────────────────────
+
+_cwe_classifier: CWEClassifier | None = None
+
+
+def get_cwe_classifier() -> CWEClassifier:
+    global _cwe_classifier
+    if _cwe_classifier is None:
+        _cwe_classifier = CWEClassifier()
+    return _cwe_classifier
+
+
 # ── CWEPredictor class — wraps prediction + NVD lookup ───────────────────────
 
 class CWEPredictor:
     """
     Hướng 3 core class: predict CWE from PE features, then fetch CVEs.
 
+    Thứ tự ưu tiên:
+      1. SecBERT ML model (nếu đã train) — dùng build_profile_text() làm input
+      2. Rule-based fallback              — dùng BEHAVIOR_TO_CWE mapping
+
     Hoạt động như fallback khi:
       - Không xác định được CPE của file
-      - CPE có nhưng NVD trả về 0 CVE (file quá obscure)
+      - CPE có nhưng NVD trả về 0 CVE
 
     Ví dụ dùng trong app.py::
 
@@ -366,6 +496,35 @@ class CWEPredictor:
         self.nvd_api          = nvd_api
         self.max_cves_per_cwe = max_cves_per_cwe
         self.top_cwes         = top_cwes
+        self._classifier      = get_cwe_classifier()
+
+        ml_status = "ML model loaded" if self._classifier.is_available() else "rule-based fallback"
+        print(f"[CWE Predictor] Initialized ({ml_status})")
+
+    def _predict_cwes(self, analysis: dict) -> tuple[list[dict], str]:
+        """
+        Predict CWEs — thử ML model trước, fallback rule-based.
+
+        Returns (predictions, method_used)
+        """
+        # ── Thử ML model trước ────────────────────────────────────────────────
+        if self._classifier.is_available():
+            try:
+                # Import build_profile_text từ secbert scorer
+                # (dùng cùng behavior text builder đã có)
+                from secbert_cve_scorer import build_profile_text
+                behavior_text = build_profile_text(analysis)
+
+                if behavior_text and len(behavior_text) > 20:
+                    ml_preds = self._classifier.predict(behavior_text, top_k=self.top_cwes + 2)
+                    if ml_preds:
+                        return ml_preds, "secbert_cwe_classifier"
+            except Exception as e:
+                print(f"[CWE ML] Prediction failed, using rule-based: {e}")
+
+        # ── Rule-based fallback ───────────────────────────────────────────────
+        rule_preds = predict_cwe(analysis, top_k=self.top_cwes + 2)
+        return rule_preds, "rule_based"
 
     def predict_and_fetch(self, analysis: dict) -> dict:
         """
@@ -382,26 +541,28 @@ class CWEPredictor:
             'predicted_cwes': list,    # ranked CWE predictions
             'cve_results':    list,    # CVEs from NVD matching those CWEs
             'total_cves':     int,
-            'method':         str,     # always 'cwe_behavior_prediction'
-            'summary':        str,     # human-readable explanation
+            'prediction_method': str, # 'secbert_cwe_classifier' | 'rule_based'
+            'method':         str,    # always 'cwe_behavior_prediction'
+            'summary':        str,    # human-readable explanation
         }
         """
         print("[CWE] Running CWE behavior prediction (Hướng 3) …")
 
-        # Step 1: Predict CWEs from static features
-        predicted = predict_cwe(analysis, top_k=self.top_cwes + 2)
+        # Step 1: Predict CWEs (ML hoặc rule-based)
+        predicted, pred_method = self._predict_cwes(analysis)
 
         if not predicted:
             return {
-                "predicted_cwes": [],
-                "cve_results":    [],
-                "total_cves":     0,
-                "method":         "cwe_behavior_prediction",
-                "summary":        "No behavioral indicators detected — cannot predict CWE.",
+                "predicted_cwes":    [],
+                "cve_results":       [],
+                "total_cves":        0,
+                "prediction_method": pred_method,
+                "method":            "cwe_behavior_prediction",
+                "summary":           "No behavioral indicators detected — cannot predict CWE.",
             }
 
         # Log predictions
-        print(f"[CWE] Predicted {len(predicted)} CWE(s):")
+        print(f"[CWE] Predicted {len(predicted)} CWE(s) via {pred_method}:")
         for p in predicted:
             print(f"      {p['cwe_id']} ({p['label']}, conf={p['confidence']:.2f}): {p['name']}")
 
@@ -446,9 +607,10 @@ class CWEPredictor:
         print(f"[CWE] Done — {len(all_cves)} unique CVEs from {len(predicted[:self.top_cwes])} CWE queries")
 
         return {
-            "predicted_cwes": predicted,
-            "cve_results":    all_cves[:50],
-            "total_cves":     len(all_cves),
-            "method":         "cwe_behavior_prediction",
-            "summary":        summary,
+            "predicted_cwes":    predicted,
+            "cve_results":       all_cves[:50],
+            "total_cves":        len(all_cves),
+            "prediction_method": pred_method,
+            "method":            "cwe_behavior_prediction",
+            "summary":           summary,
         }
