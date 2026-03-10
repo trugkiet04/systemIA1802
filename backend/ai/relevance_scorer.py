@@ -1,29 +1,25 @@
 """
-Unified CVE Relevance Scorer
+Unified CVE Relevance Scorer — SecBERT only
+============================================
 
-Combines rule-based contextual scoring (always available) and SecBERT
-semantic scoring (optional) into a single coherent 'relevance' field.
+Dùng SecBERT để tính semantic similarity giữa behavior profile của file PE
+và mô tả CVE. Đây là cách duy nhất tính relevance — không còn rule-based
+scoring với hardcoded weights nữa.
+
+Khi SecBERT không available:
+  → Không fake score, chỉ sort CVEs theo CVSS score (cao nhất trước).
 
 Usage:
     from ai.relevance_scorer import score_cves, is_semantic_available
 
     cves = score_cves(software_analysis, cves)
-    # Each CVE now has: cve['relevance'] = {score, label, method, reasons}
+    # Each CVE now has: cve['relevance'] = {score, label, method, model}
 """
 
 import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
-
-try:
-    from contextual_scorer import (
-        score_cves as _ctx_score,
-        build_file_profile as _build_profile,
-    )
-    _CTX_OK = True
-except Exception:
-    _CTX_OK = False
 
 try:
     from secbert_cve_scorer import (
@@ -37,99 +33,79 @@ except Exception:
     _sec_ok = lambda: False
 
 
-# ── Label thresholds ─────────────────────────────────────────────────────────
-def _score_to_label(score: float) -> str:
-    if score >= 0.75:
-        return 'CRITICAL'
-    if score >= 0.55:
-        return 'HIGH'
-    if score >= 0.35:
-        return 'MEDIUM'
-    if score >= 0.15:
-        return 'LOW'
-    return 'MINIMAL'
-
-
 def score_cves(software_analysis: dict, cves: list) -> list:
     """
-    Score CVE relevance to a specific piece of software.
+    Score CVE relevance using SecBERT semantic similarity.
 
-    Args:
-        software_analysis: Output from software_analyzer (PE analysis dict)
-                           or a simplified dict for package-based analysis.
-        cves:              List of CVE dicts from NVD.
-
-    Returns:
-        Same CVE list with each entry enriched:
+    Mỗi CVE sẽ có thêm field:
         cve['relevance'] = {
-            'score':   float,           # 0.0 – 1.0
-            'label':   str,             # CRITICAL/HIGH/MEDIUM/LOW/MINIMAL
-            'method':  str,             # 'combined'|'semantic'|'contextual'|'none'
-            'reasons': [str, ...],      # human-readable reasons (from contextual scorer)
+            'score':  float,   # cosine similarity 0.0–1.0 (SecBERT)
+            'label':  str,     # CRITICAL / HIGH / MEDIUM / LOW / MINIMAL
+            'method': str,     # 'secbert' | 'cvss_only'
+            'model':  str,     # tên model đang dùng
         }
-        List is sorted by relevance score DESC, then CVSS score DESC.
+
+    Nếu SecBERT không available:
+        → method = 'cvss_only', score = normalized CVSS (0–1), sort by CVSS DESC
     """
     if not cves:
         return cves
 
-    # ── 1. Rule-based contextual scoring ─────────────────────────────────────
-    if _CTX_OK:
-        try:
-            cves = _ctx_score(software_analysis, cves)
-        except Exception:
-            pass
-
-    # ── 2. SecBERT semantic scoring ───────────────────────────────────────────
+    # ── SecBERT semantic scoring ───────────────────────────────────────────────
     if _SECBERT_IMPORTED and _sec_ok():
         try:
             cves = _sec_score(software_analysis, cves)
+
+            # Map secbert_relevance → unified relevance field
+            for cve in cves:
+                sec = cve.get('secbert_relevance', {})
+                cve['relevance'] = {
+                    'score':  sec.get('score', 0.0),
+                    'label':  sec.get('label', 'MINIMAL'),
+                    'method': 'secbert',
+                    'model':  sec.get('model', ''),
+                }
+
+            # Sort: SecBERT score DESC, then CVSS DESC
+            cves.sort(
+                key=lambda c: (
+                    c.get('relevance', {}).get('score', 0.0),
+                    c.get('cvss_score', 0.0),
+                ),
+                reverse=True,
+            )
+            return cves
+
         except Exception:
-            pass
+            pass  # fall through to CVSS-only
 
-    # ── 3. Merge into unified 'relevance' field ───────────────────────────────
+    # ── Fallback: sort by CVSS, no fake scoring ────────────────────────────────
+    cves.sort(key=lambda c: float(c.get('cvss_score') or 0), reverse=True)
     for cve in cves:
-        ctx = cve.get('contextual_relevance', {})
-        sec = cve.get('secbert_relevance', {})
-
-        ctx_score  = float(ctx.get('score', 0))
-        sec_score  = float(sec.get('score', 0))
-        ctx_reasons = ctx.get('reasons', [])
-
-        if ctx_score > 0 and sec_score > 0:
-            # Weighted combination: SecBERT = 60%, contextual = 40%
-            combined = ctx_score * 0.40 + sec_score * 0.60
-            method   = 'combined'
-        elif sec_score > 0:
-            combined = sec_score
-            method   = 'semantic'
-        elif ctx_score > 0:
-            combined = ctx_score
-            method   = 'contextual'
-        else:
-            combined = 0.0
-            method   = 'none'
-
+        cvss = float(cve.get('cvss_score') or 0)
         cve['relevance'] = {
-            'score':   round(combined, 4),
-            'label':   _score_to_label(combined),
-            'method':  method,
-            'reasons': ctx_reasons,
+            'score':  round(cvss / 10.0, 4),   # normalize 0–10 → 0–1
+            'label':  _cvss_label(cvss),
+            'method': 'cvss_only',
+            'model':  '',
         }
-
-    # ── 4. Sort: relevance DESC, then CVSS DESC ───────────────────────────────
-    cves.sort(
-        key=lambda c: (
-            c.get('relevance', {}).get('score', 0.0),
-            c.get('cvss_score', 0.0),
-        ),
-        reverse=True,
-    )
-
     return cves
 
 
+def _cvss_label(cvss: float) -> str:
+    if cvss >= 9.0:
+        return 'CRITICAL'
+    if cvss >= 7.0:
+        return 'HIGH'
+    if cvss >= 4.0:
+        return 'MEDIUM'
+    if cvss > 0:
+        return 'LOW'
+    return 'NONE'
+
+
 def get_profile_text(software_analysis: dict) -> str:
-    """Return natural-language behavior profile for display."""
+    """Return natural-language behavior profile generated by SecBERT scorer."""
     if _SECBERT_IMPORTED:
         try:
             return _build_profile_text(software_analysis)

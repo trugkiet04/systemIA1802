@@ -123,7 +123,16 @@ NVD_PAGE_LIMIT = 2000
 # ── CVE parser ────────────────────────────────────────────────────────────────
 
 def _parse_vuln(vuln: dict) -> dict | None:
-    """Extract (cve_id, description, cvss_score, severity, vector_string)."""
+    """
+    Extract CVE fields including CWE labels.
+
+    Columns produced
+    ----------------
+    cve_id, description, cvss_score, severity, vector_string, cwe_ids
+
+    cwe_ids : pipe-separated CWE identifiers, e.g. "CWE-94|CWE-78"
+              Empty string when NVD has no weakness data for the CVE.
+    """
     cve    = vuln.get("cve", {})
     cve_id = cve.get("id", "")
 
@@ -161,12 +170,26 @@ def _parse_vuln(vuln: dict) -> dict | None:
     if severity not in VALID_SEVERITIES:
         return None
 
+    # CWE extraction (Hướng 3 dataset) ────────────────────────────────────────
+    # NVD API returns: cve.weaknesses[].description[{lang, value}]
+    # value is a CWE-ID string like "CWE-94", "CWE-78", or "NVD-CWE-Other"
+    cwe_ids: list[str] = []
+    for weakness in cve.get("weaknesses", []):
+        for d in weakness.get("description", []):
+            if d.get("lang") == "en":
+                val = d.get("value", "").strip()
+                # Only keep proper CWE-nnn IDs, skip NVD-CWE-noinfo / Other
+                if val.startswith("CWE-") and val[4:].isdigit():
+                    if val not in cwe_ids:
+                        cwe_ids.append(val)
+
     return {
         "cve_id":        cve_id,
         "description":   desc,
         "cvss_score":    score,
         "severity":      severity,
         "vector_string": vector,
+        "cwe_ids":       "|".join(cwe_ids),   # e.g. "CWE-94|CWE-78" or ""
     }
 
 
@@ -369,12 +392,25 @@ def balance_dataset(records: list, strategy: str = "oversample") -> list:
 
 def save_csv(records: list, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["cve_id", "description", "cvss_score", "severity", "vector_string"]
+    # cwe_ids added for Hướng 3 — CWE behavior prediction training data
+    fields = ["cve_id", "description", "cvss_score", "severity", "vector_string", "cwe_ids"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(records)
     print(f"\n  Saved {len(records):,} records → {path}")
+
+    # Also save a CWE-labeled subset for Hướng 3
+    cwe_path  = path.parent / "cve_cwe_train.csv"
+    cwe_fields = ["cve_id", "description", "cwe_ids", "severity"]
+    cwe_records = [r for r in records if r.get("cwe_ids")]
+    if cwe_records:
+        with open(cwe_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cwe_fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(cwe_records)
+        pct = len(cwe_records) / len(records) * 100
+        print(f"  Saved {len(cwe_records):,} CWE-labeled records ({pct:.1f}%) → {cwe_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

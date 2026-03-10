@@ -70,10 +70,11 @@ import sys
 import time
 from pathlib import Path
 
-ROOT     = Path(__file__).parent.parent
-UTILS    = ROOT / "untils"
-MODELS   = ROOT / "models"
-DATA_CSV = ROOT / "data" / "training" / "cve_severity_train.csv"
+ROOT         = Path(__file__).parent.parent
+UTILS        = ROOT / "untils"
+MODELS       = ROOT / "models"
+DATA_CSV     = ROOT / "data" / "training" / "cve_severity_train.csv"
+CWE_CSV      = ROOT / "data" / "training" / "cve_cwe_train.csv"
 
 # Minimum records to consider dataset usable
 MIN_DATASET_RECORDS = 500
@@ -190,6 +191,33 @@ def step_finetune_bert(force: bool, bert_model: str, epochs: int, batch: int) ->
     return ok
 
 
+def step_train_cwe(force: bool, bert_model: str, epochs: int, batch: int) -> bool:
+    """Step 3.5: Fine-tune SecBERT for CWE classification (Hướng 3)."""
+    out_dir  = MODELS / "bert_cwe"
+    out_meta = MODELS / "bert_cwe_meta.json"
+
+    if not force and _check_output([out_meta]) and out_dir.exists():
+        print(f"\n[SKIP] CWE model exists: {out_dir.name}/")
+        return True
+
+    if not CWE_CSV.exists() or _count_csv(CWE_CSV) < 100:
+        print(f"\n[SKIP] CWE dataset not ready: {CWE_CSV.name}")
+        print("       Run build_training_data.py first to generate cve_cwe_train.csv")
+        return False
+
+    print(f"\n[Step 3.5] Fine-tuning CWE classifier ({bert_model}) …")
+    ok = _run(
+        [
+            sys.executable, str(UTILS / "train_cwe_classifier.py"),
+            "--model",  bert_model,
+            "--epochs", str(epochs),
+            "--batch",  str(batch),
+        ],
+        "CWE classifier fine-tuning",
+    )
+    return ok
+
+
 def step_build_cpe_index(force: bool) -> bool:
     """Step 4: Build FAISS CPE semantic search index."""
     out_idx  = MODELS / "cpe_index.faiss"
@@ -227,7 +255,8 @@ def print_summary(results: dict[str, bool]) -> None:
     labels = {
         "dataset":   "Dataset (NVD CVEs)",
         "tfidf":     "TF-IDF + Logistic Regression",
-        "bert":      "Fine-tuned SecBERT",
+        "bert":      "Fine-tuned SecBERT (Severity)",
+        "cwe":       "Fine-tuned SecBERT (CWE — Hướng 3)",
         "cpe_index": "FAISS CPE Index",
         "evaluate":  "Model Evaluation",
     }
@@ -251,9 +280,11 @@ def print_summary(results: dict[str, bool]) -> None:
     print("\n  Output files:")
     for p in [
         DATA_CSV,
+        CWE_CSV,
         MODELS / "severity_clf.pkl",
         MODELS / "severity_report.txt",
         MODELS / "bert_severity_meta.json",
+        MODELS / "bert_cwe_meta.json",
         MODELS / "cpe_index.faiss",
         report_json,
         report_txt,
@@ -285,6 +316,10 @@ def main():
     parser.add_argument(
         "--skip-bert", action="store_true",
         help="Skip BERT fine-tuning (use on CPU-only machines)",
+    )
+    parser.add_argument(
+        "--skip-cwe", action="store_true",
+        help="Skip CWE classifier fine-tuning (Hướng 3)",
     )
     parser.add_argument(
         "--skip-cpe", action="store_true",
@@ -355,6 +390,19 @@ def main():
             batch      = args.bert_batch,
         )
         results["bert"] = ok
+
+    # ── Step 3.5: CWE classifier (Hướng 3) ──
+    if args.skip_bert or args.skip_cwe:
+        print("\n[SKIP] CWE classifier (--skip-bert or --skip-cwe)")
+        results["cwe"] = None
+    else:
+        ok = step_train_cwe(
+            force      = args.force,
+            bert_model = args.bert_model,
+            epochs     = args.bert_epochs,
+            batch      = args.bert_batch,
+        )
+        results["cwe"] = ok
 
     # ── Step 4: CPE index ──
     if args.skip_cpe:

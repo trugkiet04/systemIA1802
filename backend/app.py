@@ -38,6 +38,7 @@ from ai_analyzer         import (
 from cpe_semantic_matcher import (
     match_best as sem_match_best, is_available as sem_available,
 )
+from cwe_predictor import CWEPredictor
 
 # ── Unified AI pipeline (replaces individual model imports) ──────────────────
 from ai.severity_pipeline import (
@@ -70,12 +71,13 @@ nvd_api       = None
 cpe_extractor = None
 pe_analyzer   = None
 pkg_analyzer  = None
+cwe_predictor = None
 
 
 # ── Initialization ────────────────────────────────────────────────────────────
 
 def init_app():
-    global nvd_api, cpe_extractor, pe_analyzer, pkg_analyzer
+    global nvd_api, cpe_extractor, pe_analyzer, pkg_analyzer, cwe_predictor
 
     print("=" * 70)
     print("[*] SOFTWARE VULNERABILITY ASSESSMENT TOOL")
@@ -93,11 +95,13 @@ def init_app():
     cpe_extractor = CPEExtractor()
     pe_analyzer   = PEStaticAnalyzer()
     pkg_analyzer  = PackageAnalyzer()
+    cwe_predictor = CWEPredictor(nvd_api)
 
     print("[+] NVD API v2 initialized")
     print("[+] CPE Extractor initialized")
     print("[+] PE Static Analyzer initialized")
     print("[+] Package Analyzer initialized")
+    print("[+] CWE Predictor initialized (Hướng 3)")
     print(f"    Supported: {', '.join(PackageAnalyzer.supported_filenames()[:8])} ...")
 
     print()
@@ -336,6 +340,24 @@ def _analyze_pe(filepath: Path, filename: str):
                 )
         else:
             print(f"[PE] No CPE resolved — skipping CVE lookup")
+
+        # ── Hướng 3: CWE Behavior Prediction (fallback) ───────────────────────
+        # Kích hoạt khi:
+        #   (a) Không xác định được CPE → không có CVE nào từ NVD
+        #   (b) CPE có nhưng NVD trả về 0 CVE
+        no_cves = len(result.get('vulnerabilities', [])) == 0
+        if no_cves:
+            print("[PE] No CVEs from CPE lookup → running CWE behavior prediction")
+            cwe_result = cwe_predictor.predict_and_fetch(result)
+            result['cwe_analysis'] = cwe_result
+
+            # Nếu CWE prediction tìm được CVE, dùng làm vulnerabilities
+            if cwe_result.get('cve_results'):
+                cwe_cves = cwe_result['cve_results']
+                cwe_cves = _enrich_cves(cwe_cves, result)
+                result['vulnerabilities'] = cwe_cves[:50]
+                result['cve_statistics']  = _calc_stats(cwe_cves)
+                result['cve_source']      = 'cwe_behavior_prediction'
 
         # AI static behavior (when no CVEs or high-risk file)
         risk_level = result.get('risk', {}).get('level', 'CLEAN')
@@ -660,14 +682,15 @@ def get_status():
         'secbert_relevance': secbert_available(),
         'package_ecosystems': PackageAnalyzer.supported_filenames(),
         'features': {
-            'pe_binary_analysis':      True,
+            'pe_binary_analysis':        True,
             'package_manifest_analysis': True,
-            'software_name_search':    True,
-            'direct_cpe_query':        True,
-            'ai_cpe_matching':         ai_available(),
-            'ai_risk_narrative':       ai_available(),
-            'severity_ml_ensemble':    sv['available'],
-            'semantic_cve_relevance':  secbert_available(),
+            'software_name_search':      True,
+            'direct_cpe_query':          True,
+            'ai_cpe_matching':           ai_available(),
+            'ai_risk_narrative':         ai_available(),
+            'severity_ml_ensemble':      sv['available'],
+            'semantic_cve_relevance':    secbert_available(),
+            'cwe_behavior_prediction':   True,   # Hướng 3 — always on
         },
     })
 

@@ -358,15 +358,87 @@ class NVDAPIv2:
             'cna': cve.get('sourceIdentifier', 'Unknown')
         }
     
+    def search_by_cwe(self, cwe_id: str, max_results: int = 20) -> list:
+        """
+        Search CVEs by CWE ID — used by Hướng 3 (CWE behavior prediction).
+
+        NVD API parameter: cweId (e.g. "CWE-94", "CWE-78")
+        Returns CVEs that have been classified under the given weakness type.
+
+        Args:
+            cwe_id:      CWE identifier string, e.g. "CWE-94"
+            max_results: Maximum number of CVEs to return
+
+        Returns:
+            List of CVE dicts (same format as search_by_cpe / search_by_keyword)
+        """
+        print(f"\n[NVD Search] CWE query: {cwe_id} (max {max_results})")
+
+        all_cves: list = []
+        start_index    = 0
+        total_results  = None
+
+        while True:
+            self._rate_limit()
+
+            params = {
+                "cweId":          cwe_id,
+                "resultsPerPage": min(max_results, 2000),
+                "startIndex":     start_index,
+            }
+            headers = {"apiKey": self.api_key} if self.api_key else {}
+
+            try:
+                response = requests.get(
+                    self.base_url,
+                    params=params,
+                    headers=headers,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if total_results is None:
+                    total_results = data.get("totalResults", 0)
+                    print(f"[NVD Search] [+] {cwe_id}: {total_results:,} total CVEs in NVD")
+                    if total_results == 0:
+                        return []
+
+                vulnerabilities = data.get("vulnerabilities", [])
+                for vuln in vulnerabilities:
+                    cve_data = self._parse_cve(vuln)
+                    cve_data["search_method"] = "cwe"
+                    all_cves.append(cve_data)
+
+                start_index += len(vulnerabilities)
+
+                if start_index >= total_results:
+                    break
+                if len(all_cves) >= max_results:
+                    all_cves = all_cves[:max_results]
+                    break
+                if not vulnerabilities:
+                    break
+
+            except requests.exceptions.HTTPError as e:
+                print(f"\n[NVD Search] [ERROR] CWE search HTTP error: {e}")
+                break
+            except Exception as e:
+                print(f"\n[NVD Search] [ERROR] CWE search error: {e}")
+                break
+
+        print(f"[NVD Search] [+] CWE {cwe_id}: returned {len(all_cves)} CVEs")
+        return all_cves
+
     def _rate_limit(self):
         """Enforce rate limiting"""
         current_time = time.time()
         elapsed = current_time - self.last_request_time
-        
+
         if elapsed < self.request_delay:
             sleep_time = self.request_delay - elapsed
             time.sleep(sleep_time)
-        
+
         self.last_request_time = time.time()
 
 
